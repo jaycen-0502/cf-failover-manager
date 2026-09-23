@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "lines": [
+    {
+      "line_id": 6,
+      "alias": "6号线（德国专线）",
+      "region": "eu",
+      "main_ip": "203.0.113.10",
+      "backup_ip": "198.51.100.20",
+      "port": 22,
+      "failover_threshold_ms": 280,
+      "recovery_threshold_ms": 160,
+      "external_threshold_ms": 150,
+      "domains": [
+        {
+          "zone_id": "替换为真实 Zone ID",
+          "record_id": "替换为真实 Record ID",
+          "name": "edge.example.com",
+          "proxied": false
+        }
+      ]
+    }
+  ]
+}
