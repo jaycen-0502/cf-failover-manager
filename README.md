@@ -63,6 +63,28 @@ sudo python3 /usr/local/bin/cf_manager --self-test
 sudo python3 /usr/local/bin/cf_manager
 ```
 
+### 最简单的快捷运行
+
+如果已经把仓库克隆到默认目录，日常升级和启动只需要这一条：
+
+```bash
+bash "$HOME/cf-failover-manager/deploy.sh"
+```
+
+第一次部署可以使用下面这一条：
+
+```bash
+git clone git@github.com:jaycen-0502/cf-failover-manager.git "$HOME/cf-failover-manager" && bash "$HOME/cf-failover-manager/deploy.sh"
+```
+
+安装完成后，以后直接运行：
+
+```bash
+sudo cfm
+```
+
+`deploy.sh` 会自动拉取最新代码、安装到 `/usr/local/bin/cf_manager`、执行自测并打开菜单。私有仓库仍需要 VPS 配置 GitHub SSH key。
+
 主菜单中选择 `[2]`，按提示填写：
 
 1. 线路编号和别名；
