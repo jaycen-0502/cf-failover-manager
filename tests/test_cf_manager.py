@@ -141,6 +141,48 @@ COMMAND_RE = re.compile(r"^(switch|backup)_([1-6])$")
             with self.assertRaisesRegex(cf_manager.ManagerError, "failed"):
                 runner.run(["systemctl", "daemon-reload"], check=True)
 
+    def test_domain_add_and_remove_helpers(self):
+        existing = [cf_manager.DomainRecord("z", "r1", "one.example.com")]
+        with mock.patch("builtins.input", side_effect=["z2", "r2", "two.example.com"]):
+            updated = cf_manager.add_domain_interactively(existing)
+        self.assertEqual([item.name for item in updated], ["one.example.com", "two.example.com"])
+        with mock.patch("builtins.input", return_value="1"), mock.patch(
+            "cf_manager.confirm", return_value=True
+        ):
+            remaining = cf_manager.remove_domain_interactively(updated)
+        self.assertEqual([item.name for item in remaining], ["two.example.com"])
+
+    def test_rewrite_line_updates_ip_and_domains(self):
+        config = self.config()
+        store = cf_manager.ConfigStore(self.paths.config_file)
+        store.save({6: config})
+        self.paths.bin_dir.mkdir(parents=True)
+        self.paths.systemd_dir.mkdir(parents=True)
+        self.paths.tg_bot.parent.mkdir(parents=True)
+        self.paths.tg_bot.write_text(
+            Path("examples/tg_bot.example.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        updated = cf_manager.dataclasses.replace(
+            config,
+            main_ip="203.0.113.99",
+            domains=[
+                config.domains[0],
+                cf_manager.DomainRecord("zone2", "record2", "api.example.com"),
+            ],
+        )
+        cf_manager.rewrite_line(
+            updated,
+            cf_manager.Credentials("cf", "tg"),
+            self.paths,
+            store,
+            cf_manager.CommandRunner(dry_run=True),
+            6,
+        )
+        self.assertIn("203.0.113.99", self.paths.failover_path(6).read_text(encoding="utf-8"))
+        self.assertIn("api.example.com", self.paths.manual_path(6).read_text(encoding="utf-8"))
+        self.assertEqual(store.load()[6].main_ip, "203.0.113.99")
+
 
 if __name__ == "__main__":
     unittest.main()

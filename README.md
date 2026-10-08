@@ -8,6 +8,7 @@
 ## 已完成的功能
 
 - 中文 ANSI 菜单：状态总览、添加线路、Cloudflare 记录检索、编辑、删除、服务管理、全量备份。
+- 线路分项编辑：选定线路后可查看脚本名与全部绑定域名，只修改主 IP、备用 IP，手动添加/删除域名；每次保存自动重写脚本并重启对应 systemd 服务。
 - Cloudflare Token：优先读取环境变量或已有 `cf_failover*.py`，也支持交互输入并调用 Token Verify API。
 - Cloudflare Zone/A 记录：列出 Zone 和 A 记录，支持逗号多选，也支持现场新建 A 记录。
 - 自动脚本：5 包 TCP 平均延迟、三次间隔 20 秒复核、Check-Host 区域仲裁、状态文件和锁文件。
@@ -80,6 +81,19 @@ sudo python3 /usr/local/bin/cf_manager
 ```
 
 如果存在 `/root/tg_bot.py`，程序会先创建 `/root/tg_bot.py.bak`，再注入服务和命令映射。注入完成后请检查输出的 BotFather 命令，并按需重启机器人。
+
+### 修改指定线路
+
+主菜单选择 `[4] 线路参数调整`，再输入线路编号。编辑菜单支持：
+
+1. 查看该线路的监控脚本、手动脚本、主备 IP 和全部绑定域名；
+2. 只修改主 IP；
+3. 只修改备用 IP；
+4. 手动添加域名（Zone ID、Record ID、完整域名）；
+5. 删除指定域名（需要输入 `DELETE` 二次确认）；
+6. 完整编辑线路参数。
+
+每次保存都会重新生成对应 `cf_failover_N.py`、`cfN.py`，更新配置和 Telegram 映射，并执行 `systemctl stop`、`daemon-reload`、`enable --now` 自动重启该线路服务。域名添加只绑定已有 Cloudflare 记录，不会误创建 DNS 记录。
 
 ## 凭证配置
 

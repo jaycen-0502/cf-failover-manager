@@ -1045,12 +1045,12 @@ def inject_tg_bot(path: Path, config: LineConfig, max_line_id: int | None = None
         candidate,
         f"COMMAND_MAPPING",
         f"cf_status{config.line_id}",
-        f"/usr/local/bin/cf_failover_{config.line_id}.py --status",
+        f"/usr/local/bin/{'cf_failover.py' if config.line_id == 1 else f'cf_failover_{config.line_id}.py'} --status",
         f"cf_manager:{config.line_id}",
     )
-    before_regex_update = candidate
-    candidate = _expand_switch_regex(candidate, max_line_id or config.line_id)
-    if candidate == before_regex_update and "switch|backup" in candidate:
+    command_max = max_line_id or config.line_id
+    candidate = _expand_switch_regex(candidate, command_max)
+    if "switch|backup" in candidate and not re.search(rf"\[1-{command_max}\]", candidate):
         warning("未识别 tg_bot.py 的 switch/backup 正则格式；已保留原代码，请手动确认新线路命令解析范围")
     try:
         ast.parse(candidate)
@@ -1379,49 +1379,133 @@ def edit_line(paths: Paths, store: ConfigStore, runner: CommandRunner) -> None:
     if selected not in lines:
         error("线路不存在")
         return
-    old = lines[selected]
-    config, credentials = prompt_line(paths, old)
-    if config.line_id != selected and config.line_id in lines:
-        raise ManagerError("新的线路编号已被占用")
+
+    config = lines[selected]
+    while True:
+        print(f"\n线路 {selected}：{config.alias}")
+        print("  [1] 查看脚本路径、主备 IP 和已绑定域名")
+        print("  [2] 修改主 IP")
+        print("  [3] 修改备用 IP")
+        print("  [4] 添加域名记录（手动填写 Zone ID/Record ID/域名）")
+        print("  [5] 删除域名记录")
+        print("  [6] 完整编辑线路参数")
+        print("  [0] 返回上一级")
+        action = input("请选择: ").strip()
+        try:
+            if action == "0":
+                return
+            if action == "1":
+                show_line_details(config, paths)
+                continue
+            if action == "2":
+                config = dataclasses.replace(config, main_ip=prompt_ipv4("新的主节点 IP", config.main_ip))
+            elif action == "3":
+                config = dataclasses.replace(config, backup_ip=prompt_ipv4("新的备用节点 IP", config.backup_ip))
+            elif action == "4":
+                config = dataclasses.replace(config, domains=add_domain_interactively(config.domains))
+            elif action == "5":
+                config = dataclasses.replace(config, domains=remove_domain_interactively(config.domains))
+            elif action == "6":
+                edited, _ = prompt_line(paths, config)
+                config = dataclasses.replace(edited, line_id=selected)
+            else:
+                warning("无效选项，请输入 0~6")
+                continue
+            credentials = generation_credentials(paths)
+            rewrite_line(config, credentials, paths, store, runner, selected)
+            success(f"线路 {selected} 已保存，服务已自动重启")
+        except (ManagerError, CloudflareError) as exc:
+            error(str(exc))
+        except KeyboardInterrupt:
+            print()
+            info("已取消本次修改")
+
+
+def show_line_details(config: LineConfig, paths: Paths) -> None:
+    """把用户最关心的脚本、主备 IP 和 DNS 绑定集中展示。"""
+    print(f"\n线路名称: {config.alias}")
+    print(f"监控脚本: {paths.failover_path(config.line_id)}")
+    print(f"手动脚本: {paths.manual_path(config.line_id)}")
+    print(f"systemd:  {paths.service_path(config.line_id)}")
+    print(f"主 IP:    {config.main_ip}:{config.port}")
+    print(f"备用 IP:  {config.backup_ip}:{config.port}")
+    print("绑定域名:")
+    for index, domain in enumerate(config.domains, 1):
+        print(f"  [{index}] {domain.name}  zone={domain.zone_id}  record={domain.record_id}")
+
+
+def add_domain_interactively(existing: Sequence[DomainRecord]) -> list[DomainRecord]:
+    print("\n添加域名记录（只写入线路配置，不会自动创建 Cloudflare 记录）")
+    zone_id = ask("Zone ID").strip()
+    record_id = ask("Record ID").strip()
+    name = ask("完整域名，例如 edge.example.com").strip()
+    if not zone_id or not record_id or not name:
+        raise ManagerError("Zone ID、Record ID 和域名都不能为空")
+    if any(item.record_id == record_id or item.name == name for item in existing):
+        raise ManagerError("该 Record ID 或域名已经绑定到此线路")
+    return [*existing, DomainRecord(zone_id, record_id, name, False)]
+
+
+def remove_domain_interactively(existing: Sequence[DomainRecord]) -> list[DomainRecord]:
+    if len(existing) <= 1:
+        raise ManagerError("线路至少需要保留一条域名记录")
+    print("当前绑定域名:")
+    for index, domain in enumerate(existing, 1):
+        print(f"  [{index}] {domain.name} ({domain.record_id})")
+    index = ask_int("要删除的域名编号", 1, 1, len(existing))
+    if not confirm(f"确定删除绑定 {existing[index - 1].name}", "DELETE"):
+        raise ManagerError("已取消删除域名")
+    return [item for position, item in enumerate(existing, 1) if position != index]
+
+
+def generation_credentials(paths: Paths) -> Credentials:
+    """优先复用已生成脚本凭证，仅在没有 Token 时才进入交互鉴权。"""
+    credentials = discover_credentials(paths)
+    if not credentials.cf_api_token:
+        return choose_credentials(paths)
+    return credentials
+
+
+def rewrite_line(
+    config: LineConfig,
+    credentials: Credentials,
+    paths: Paths,
+    store: ConfigStore,
+    runner: CommandRunner,
+    selected: int,
+) -> None:
+    """原子重写一条线路并自动重启服务；任何一步失败都恢复旧文件。"""
+    config.validate()
+    lines = store.load()
+    if selected not in lines:
+        raise ManagerError(f"线路 {selected} 不存在")
     old_generated = (paths.failover_path(selected), paths.manual_path(selected), paths.service_path(selected))
-    new_generated = (paths.failover_path(config.line_id), paths.manual_path(config.line_id), paths.service_path(config.line_id))
-    if config.line_id != selected and any(path.exists() for path in new_generated):
-        raise ManagerError(f"新线路编号 {config.line_id} 的目标文件已存在，拒绝覆盖")
-    tg_backup = paths.tg_bot.with_suffix(paths.tg_bot.suffix + ".bak")
-    snapshots = snapshot_files(
-        [*old_generated, *new_generated, paths.state_path(selected), paths.lock_path(selected),
-         paths.config_file, paths.tg_bot, tg_backup]
-    )
+    snapshots = snapshot_files([
+        *old_generated,
+        paths.config_file,
+        paths.tg_bot,
+        paths.tg_bot.with_suffix(paths.tg_bot.suffix + ".bak"),
+    ])
     try:
         if sys.platform.startswith("linux") and _is_root():
             runner.run(["systemctl", "stop", f"cf-failover-{selected}"], check=True)
-            if config.line_id != selected:
-                runner.run(["systemctl", "disable", f"cf-failover-{selected}"], check=True)
-        if config.line_id != selected:
-            lines.pop(selected)
-        lines[config.line_id] = config
-        executable_write(paths.failover_path(config.line_id), render_failover_script(config, credentials, paths))
-        executable_write(paths.manual_path(config.line_id), render_manual_script(config, credentials))
-        atomic_write(paths.service_path(config.line_id), render_systemd_unit(config, paths))
+        lines[selected] = config
+        executable_write(paths.failover_path(selected), render_failover_script(config, credentials, paths))
+        executable_write(paths.manual_path(selected), render_manual_script(config, credentials))
+        atomic_write(paths.service_path(selected), render_systemd_unit(config, paths))
         store.save(lines)
         if paths.tg_bot.exists():
             remove_tg_bot_line(paths.tg_bot, selected, max(lines, default=1))
             inject_tg_bot(paths.tg_bot, config, max(lines))
-        if config.line_id != selected:
-            for path in old_generated:
-                path.unlink(missing_ok=True)
-            paths.state_path(selected).unlink(missing_ok=True)
-            paths.lock_path(selected).unlink(missing_ok=True)
         if sys.platform.startswith("linux") and _is_root():
             runner.run(["systemctl", "daemon-reload"], check=True)
-            runner.run(["systemctl", "enable", "--now", f"cf-failover-{config.line_id}"], check=True)
+            runner.run(["systemctl", "enable", "--now", f"cf-failover-{selected}"], check=True)
     except Exception:
         restore_files(snapshots)
         if sys.platform.startswith("linux") and _is_root():
             runner.run(["systemctl", "daemon-reload"], check=False)
             runner.run(["systemctl", "enable", "--now", f"cf-failover-{selected}"], check=False)
         raise
-    success(f"线路 {config.line_id} 已更新")
 
 
 def delete_line(paths: Paths, store: ConfigStore, runner: CommandRunner) -> None:
