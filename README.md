@@ -47,13 +47,13 @@ python .\cf_manager.py
 
 ## VPS 部署步骤
 
-仓库是私有仓库，因此 VPS 需要先配置有读取权限的 GitHub SSH key，并安装 `git` 和 Python 3。下面这一行会在首次运行时克隆仓库，之后运行时自动快进更新；然后安装管理程序、运行自测并打开中文菜单：
+仓库现在是公开仓库，VPS 只需要安装 `git` 和 Python 3，不需要配置 GitHub SSH key。下面这一行会在首次运行时克隆仓库，之后运行时自动快进更新；然后安装管理程序、运行自测并打开中文菜单：
 
 ```bash
-if [ -d "$HOME/cf-failover-manager/.git" ]; then git -C "$HOME/cf-failover-manager" pull --ff-only; else git clone git@github.com:jaycen-0502/cf-failover-manager.git "$HOME/cf-failover-manager"; fi && sudo install -o root -g root -m 700 "$HOME/cf-failover-manager/cf_manager.py" /usr/local/bin/cf_manager && sudo python3 /usr/local/bin/cf_manager --self-test && sudo python3 /usr/local/bin/cf_manager
+if [ -d "$HOME/cf-failover-manager/.git" ]; then git -C "$HOME/cf-failover-manager" pull --ff-only; else git clone https://github.com/jaycen-0502/cf-failover-manager.git "$HOME/cf-failover-manager"; fi && sudo install -o root -g root -m 700 "$HOME/cf-failover-manager/cf_manager.py" /usr/local/bin/cf_manager && sudo python3 /usr/local/bin/cf_manager --self-test && sudo python3 /usr/local/bin/cf_manager
 ```
 
-如果仓库没有配置 SSH key，可以先在 VPS 执行 `ssh -T git@github.com` 检查访问权限。此部署命令只更新管理工具，不会自动修改 DNS 或创建线路。
+此部署命令只更新管理工具，不会自动修改 DNS 或创建线路。
 
 不使用 GitHub 克隆时，也可以手动上传后安装：
 
@@ -74,7 +74,7 @@ bash "$HOME/cf-failover-manager/deploy.sh"
 第一次部署可以使用下面这一条：
 
 ```bash
-git clone git@github.com:jaycen-0502/cf-failover-manager.git "$HOME/cf-failover-manager" && bash "$HOME/cf-failover-manager/deploy.sh"
+git clone https://github.com/jaycen-0502/cf-failover-manager.git "$HOME/cf-failover-manager" && bash "$HOME/cf-failover-manager/deploy.sh"
 ```
 
 安装完成后，以后直接运行：
@@ -83,7 +83,7 @@ git clone git@github.com:jaycen-0502/cf-failover-manager.git "$HOME/cf-failover-
 sudo cfm
 ```
 
-`deploy.sh` 会自动拉取最新代码、安装到 `/usr/local/bin/cf_manager`、执行自测并打开菜单。私有仓库仍需要 VPS 配置 GitHub SSH key。
+`deploy.sh` 会自动拉取最新代码、安装到 `/usr/local/bin/cf_manager`、执行自测并打开菜单。公开仓库不需要 GitHub 登录凭证。
 
 主菜单中选择 `[2]`，按提示填写：
 

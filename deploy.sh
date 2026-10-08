@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # 大白话：第一次运行就下载，之后运行就升级；最后用 cfm 进入中文菜单。
 REPO_DIR="${CF_MANAGER_DIR:-$HOME/cf-failover-manager}"
-REPO_URL="${CF_MANAGER_REPO:-git@github.com:jaycen-0502/cf-failover-manager.git}"
+REPO_URL="${CF_MANAGER_REPO:-https://github.com/jaycen-0502/cf-failover-manager.git}"
 INSTALL_PATH="${CF_MANAGER_INSTALL_PATH:-/usr/local/bin/cf_manager}"
 
 if [[ -d "$REPO_DIR/.git" ]]; then
