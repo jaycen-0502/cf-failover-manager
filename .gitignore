@@ -6,3 +6,5 @@ outputs/
 .env
 lines.json
 *.bak
+config.json
+dns_cache.json

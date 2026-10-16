@@ -1,7 +1,7 @@
 # Cloudflare 多线路智能容灾管理中心
 
-这是一个**中文、单文件、可审计**的 Linux 运维 CLI，用来管理多条 Cloudflare DNS 容灾线路。
-它可以生成线路监控脚本、手动切换脚本和 systemd 服务，并在修改 Telegram 机器人前自动备份和做 Python 语法检查。
+这是一个**中文、可审计**的 Linux 运维工具，用来管理多条 Cloudflare DNS 容灾线路。
+仓库同时保留旧版 `cf_manager.py` 兼容入口，并提供推荐的 v2“配置与代码分离”架构：一个通用容灾引擎、一个 JSON 账本、一个中文菜单和统一的 systemd 模板。
 
 > 重要：本项目会修改 DNS、systemd 和 Telegram 机器人，属于生产运维工具。第一次使用请先在测试目录演练，确认 IP、Zone ID、Record ID 和 Token 都正确，再放到 VPS 上运行。
 
@@ -17,10 +17,59 @@
 - 备份包：包含线路脚本、systemd 单元、机器人、配置和 `restore_cf_cluster.sh`。
 - 离线自测：不访问网络、不执行 systemd，验证脚本生成、语法注入和备份逻辑。
 
+## v2 标准架构（推荐新机器使用）
+
+新版本把“线路数据”和“业务代码”彻底分开：所有线路集中放在 `/opt/cf-failover/config.json`，只运行一个通用 `failover_engine.py`，不再为 1、2、3、4、5 号线复制五份业务脚本。
+
+```text
+/opt/cf-failover/config.json       # 唯一配置账本，不提交到 GitHub
+/opt/cf-failover/failover_engine.py # 通用容灾引擎
+/opt/cf-failover/menu.py            # 中文菜单
+/opt/cf-failover/tg_bot.py          # 动态读取配置的 TG Bot
+cf-failover@1.service              # systemd 模板，线路编号统一
+```
+
+大白话理解：以后改 IP 或域名，只改一个 JSON 账本；菜单会自动重写配置、重启对应服务，避免复制脚本和手改 Python 语法。
+
+每条线路也可以单独设置 `port`（例如 22、80、443）；不填写时使用全局 `tcp_port`。
+
+### 新机器一键安装
+
+公开仓库可以直接执行：
+
+```bash
+git clone https://github.com/jaycen-0502/cf-failover-manager.git && cd cf-failover-manager && sudo bash install.sh
+```
+
+然后编辑配置并打开菜单：
+
+```bash
+sudo nano /opt/cf-failover/config.json
+sudo cf-menu
+```
+
+菜单支持查看状态、新增/修改/删除线路、配置 Token、强制切主/切备、重启服务和导出配置备份。安装脚本不会自动把示例 Token 或示例 IP 当成生产配置。
+
+### 通用引擎快捷命令
+
+```bash
+sudo python3 /opt/cf-failover/failover_engine.py --line 1 --status
+sudo python3 /opt/cf-failover/failover_engine.py --line 1 --switch
+sudo python3 /opt/cf-failover/failover_engine.py --line 1 --backup
+sudo systemctl enable --now cf-failover@1.service
+sudo systemctl enable --now tg-bot.service
+```
+
 ## 目录
 
 ```text
-cf_manager.py       # 主程序（唯一运行时源码）
+cf_manager.py       # 旧版兼容管理入口
+failover_engine.py  # v2 通用容灾引擎
+menu.py             # v2 中文配置菜单
+tg_bot.py           # v2 动态 Telegram Bot
+install.sh          # v2 Linux 一键安装
+systemd/            # v2 systemd 模板
+config.example.json # 脱敏配置模板
 README.md           # 本说明和大白话教程
 examples/           # 示例配置和最小 tg_bot.py
 tests/              # 标准库 unittest 测试
@@ -83,7 +132,7 @@ git clone https://github.com/jaycen-0502/cf-failover-manager.git "$HOME/cf-failo
 sudo cfm
 ```
 
-`deploy.sh` 会自动拉取最新代码、安装到 `/usr/local/bin/cf_manager`、执行自测并打开菜单。公开仓库不需要 GitHub 登录凭证。
+`deploy.sh` 会自动拉取最新代码并调用 v2 `install.sh`，安装完成后直接打开 `cf-menu`；公开仓库不需要 GitHub 登录凭证。
 
 主菜单中选择 `[2]`，按提示填写：
 

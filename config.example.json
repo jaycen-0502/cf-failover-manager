@@ -1,0 +1,27 @@
+{
+  "global": {
+    "cf_api_token": "YOUR_CF_API_TOKEN",
+    "tg_bot_token": "YOUR_TG_BOT_TOKEN",
+    "tg_admin_id": 0,
+    "tg_group_id": "",
+    "tcp_port": 22,
+    "check_interval": 30,
+    "recovery_interval": 1800,
+    "probe_timeout": 2.5,
+    "external_threshold_ms": 150,
+    "monitor_network_min_alive": 2
+  },
+  "lines": {
+    "1": {
+      "name": "1号线·日本专线",
+      "region": "jp",
+      "port": 22,
+      "main_ip": "203.0.113.10",
+      "backup_ip": "198.51.100.10",
+      "latency_threshold": 280,
+      "recovery_max_lat": 160,
+      "recheck_wait": 20,
+      "domains": ["edge.example.com"]
+    }
+  }
+}
