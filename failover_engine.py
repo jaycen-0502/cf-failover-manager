@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 try:
     import fcntl
 except ImportError:  # Windows 仅用于离线测试；生产运行仍要求 Linux 文件锁。
     fcntl = None
 import json
+import ipaddress
 import os
+import re
 import socket
 import statistics
 import sys
@@ -44,12 +45,18 @@ def load_config() -> dict[str, Any]:
             cfg = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         raise EngineError(f"读取配置失败: {CONFIG_PATH}: {exc}") from exc
+    if not isinstance(cfg, dict):
+        raise EngineError("配置顶层必须是 JSON 对象")
     if not isinstance(cfg.get("global"), dict) or not isinstance(cfg.get("lines"), dict):
         raise EngineError("配置必须包含 global 和 lines")
+    if any(not str(key).isdigit() or int(key) < 1 or str(int(key)) != str(key) for key in cfg["lines"]):
+        raise EngineError("线路编号必须全部为正整数")
     return cfg
 
 
 def get_line(cfg: Mapping[str, Any], line_id: str) -> dict[str, Any]:
+    if not str(line_id).isdigit() or int(line_id) < 1 or str(int(line_id)) != str(line_id):
+        raise EngineError("线路编号必须是正整数")
     line = cfg["lines"].get(str(line_id))
     if not isinstance(line, dict):
         raise EngineError(f"找不到 {line_id} 号线配置")
@@ -57,6 +64,34 @@ def get_line(cfg: Mapping[str, Any], line_id: str) -> dict[str, Any]:
     missing = [key for key in required if not line.get(key)]
     if missing:
         raise EngineError(f"{line_id} 号线缺少配置: {', '.join(missing)}")
+    domains = line["domains"]
+    def valid_domain(domain: Any) -> bool:
+        if not isinstance(domain, str) or len(domain) > 253 or "." not in domain:
+            return False
+        normalized = domain[:-1] if domain.endswith(".") else domain
+        if not normalized or normalized.endswith("."):
+            return False
+        return all(
+            0 < len(label) <= 63
+            and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+            for label in normalized.split(".")
+        )
+    if not isinstance(domains, list) or not domains or any(not valid_domain(domain) for domain in domains):
+        raise EngineError(f"{line_id} 号线 domains 必须是非空域名列表")
+    region = line.get("region", "jp")
+    if not isinstance(region, str) or region not in REGION_NODES:
+        raise EngineError(f"{line_id} 号线 region 必须是 jp、us 或 eu")
+    for key in ("main_ip", "backup_ip"):
+        try:
+            ipaddress.IPv4Address(str(line[key]))
+        except ipaddress.AddressValueError as exc:
+            raise EngineError(f"{line_id} 号线的 {key} 不是合法 IPv4 地址") from exc
+    try:
+        port = int(line.get("port", cfg.get("global", {}).get("tcp_port", 22)))
+    except (TypeError, ValueError) as exc:
+        raise EngineError(f"{line_id} 号线探活端口无效") from exc
+    if not 1 <= port <= 65535:
+        raise EngineError(f"{line_id} 号线探活端口必须在 1~65535 之间")
     return line
 
 
@@ -71,7 +106,7 @@ def _request_json(request: urllib.request.Request, timeout: float = 10) -> dict[
     return value
 
 
-def _load_cache() -> dict[str, dict[str, str]]:
+def _load_cache() -> dict[str, Any]:
     try:
         value = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
@@ -79,16 +114,30 @@ def _load_cache() -> dict[str, dict[str, str]]:
         return {}
 
 
-def _save_cache(cache: Mapping[str, Any]) -> None:
+def _save_cache(cache: Mapping[str, Any], deleted: list[str] | None = None) -> None:
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temp = CACHE_PATH.with_suffix(".tmp")
-    temp.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temp, CACHE_PATH)
+    lock_path = CACHE_PATH.with_suffix(CACHE_PATH.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock_handle:
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            existing = _load_cache()
+            merged = dict(existing)
+            for key in deleted or []:
+                merged.pop(key, None)
+            merged.update(cache)
+            temp = CACHE_PATH.with_suffix(".tmp")
+            temp.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temp, CACHE_PATH)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
     if os.name != "nt":
         os.chmod(CACHE_PATH, 0o600)
 
 
-def resolve_domain_ids(token: str, domains: list[str]) -> list[dict[str, str]]:
+def resolve_domain_ids(token: str, domains: list[str], force_refresh: bool = False) -> list[dict[str, str]]:
     """按完整域名自动查 Zone/Record ID，并缓存结果。"""
     if not token or token.startswith("YOUR_"):
         raise EngineError("未配置有效 Cloudflare API Token")
@@ -96,11 +145,18 @@ def resolve_domain_ids(token: str, domains: list[str]) -> list[dict[str, str]]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     records: list[dict[str, str]] = []
     changed = False
+    deleted: list[str] = []
+    updates: dict[str, list[dict[str, str]]] = {}
     for domain in domains:
         cached = cache.get(domain)
-        if cached and cached.get("zone_id") and cached.get("rec_id"):
-            records.append(cached)
+        cached_records = cached if isinstance(cached, list) else [cached] if isinstance(cached, dict) else []
+        if isinstance(cached, list) and cached_records and all(isinstance(item, dict) and item.get("zone_id") and item.get("rec_id") for item in cached_records) and not force_refresh:
+            records.extend(cached_records)
             continue
+        if domain in cache:
+            cache.pop(domain, None)
+            deleted.append(domain)
+            changed = True
         parts = domain.rstrip(".").split(".")
         if len(parts) < 2:
             log(f"域名格式无效，跳过: {domain}")
@@ -129,12 +185,19 @@ def resolve_domain_ids(token: str, domains: list[str]) -> list[dict[str, str]]:
         if not found:
             log(f"找不到 A 记录，跳过: {domain}")
             continue
-        item = {"zone_id": zone_id, "rec_id": str(found[0]["id"]), "name": domain}
-        cache[domain] = item
-        records.append(item)
+        items = [
+            {"zone_id": zone_id, "rec_id": str(record["id"]), "name": domain}
+            for record in found
+            if record.get("id") and record.get("type", "A") == "A" and record.get("name", domain).lower() == domain.lower()
+        ]
+        if not items:
+            log(f"找不到有效 A 记录，跳过: {domain}")
+            continue
+        updates[domain] = items
+        records.extend(items)
         changed = True
     if changed:
-        _save_cache(cache)
+        _save_cache(updates, deleted)
     return records
 
 
@@ -171,7 +234,13 @@ def notify(cfg: Mapping[str, Any], line: Mapping[str, Any], target_ip: str, mode
     global_cfg = cfg["global"]
     title = "一键切主" if mode == "MAIN" else "一键切备"
     # 群组消息不显示毫秒；详细数据只发管理员私聊。
-    group_text = f"【{line['name']}】线路异常/解析已切换到{('主节点' if mode == 'MAIN' else '备用节点')}。"
+    if count == total:
+        if mode == "MAIN":
+            group_text = f"【{line['name']}】主节点已恢复，解析已切回主节点。"
+        else:
+            group_text = f"【{line['name']}】主节点连接超时/线路异常，已切换备用节点。"
+    else:
+        group_text = f"【{line['name']}】线路异常，DNS 更新未完成，请检查配置。"
     private = f"【{line['name']}】{title}\n目标 IP: {target_ip}\n解析成功: {count}/{total}"
     if latencies:
         private += "\n复核延迟: " + ", ".join(f"{value:.1f}ms" for value in latencies)
@@ -180,12 +249,60 @@ def notify(cfg: Mapping[str, Any], line: Mapping[str, Any], target_ip: str, mode
 
 
 def update_dns(cfg: Mapping[str, Any], line_id: str, line: Mapping[str, Any], target_ip: str, mode: str, latencies: list[float] | None = None) -> int:
-    records = resolve_domain_ids(str(cfg["global"].get("cf_api_token", "")), list(line.get("domains", [])))
     token = str(cfg["global"].get("cf_api_token", ""))
+    domains = list(line.get("domains", []))
+    records = resolve_domain_ids(token, domains)
     with ThreadPoolExecutor(max_workers=min(10, max(1, len(records)))) as executor:
         results = list(executor.map(lambda record: _cloudflare_update(record, target_ip, token), records))
-    count = sum(results)
-    notify(cfg, line, target_ip, mode, count, len(line.get("domains", [])), latencies)
+    def fully_updated(items: list[dict[str, str]], outcomes: list[bool]) -> set[str]:
+        totals: dict[str, int] = {}
+        successes: dict[str, int] = {}
+        for record, ok in zip(items, outcomes):
+            name = record["name"]
+            totals[name] = totals.get(name, 0) + 1
+            successes[name] = successes.get(name, 0) + int(bool(ok))
+        return {name for name, total in totals.items() if successes.get(name) == total}
+
+    successful_domains = fully_updated(records, results)
+    failed_domains = [domain for domain in domains if domain not in successful_domains]
+    retry_records: list[dict[str, str]] = []
+    if failed_domains:
+        try:
+            refreshed = resolve_domain_ids(token, failed_domains, force_refresh=True)
+            retry_records = [record for record in refreshed if record["name"] in failed_domains]
+            with ThreadPoolExecutor(max_workers=min(10, max(1, len(retry_records)))) as executor:
+                retry_results = list(executor.map(lambda record: _cloudflare_update(record, target_ip, token), retry_records))
+            successful_domains.update(fully_updated(retry_records, retry_results))
+        except EngineError as exc:
+            log(f"DNS 记录刷新/重试失败: {exc}")
+    count = sum(1 for domain in domains if domain in successful_domains)
+    if count != len(domains):
+        previous_mode = get_state(line_id)
+        rollback_ip = line["main_ip"] if previous_mode == "MAIN" else line["backup_ip"]
+        # DNS updates are transactional at the line level: undo successful
+        # domains too, or a failed switch can leave part of the line split.
+        rollback_by_domain: dict[str, list[dict[str, str]]] = {}
+        for record in records:
+            rollback_by_domain.setdefault(record["name"], []).append(record)
+        for domain in failed_domains:
+            refreshed_records = [record for record in retry_records if record["name"] == domain]
+            if refreshed_records:
+                rollback_by_domain[domain] = refreshed_records
+        rollback_records = {
+            (record["zone_id"], record["rec_id"]): record
+            for items in rollback_by_domain.values()
+            for record in items
+        }
+        with ThreadPoolExecutor(max_workers=min(10, max(1, len(rollback_records)))) as executor:
+            rollback_results = list(
+                executor.map(lambda record: _cloudflare_update(record, rollback_ip, token), rollback_records.values())
+            )
+        if not all(rollback_results):
+            log(f"严重：DNS 部分更新后回滚也未全部成功，请立即核对线路状态和解析（目标 {rollback_ip}）")
+        else:
+            log(f"DNS 更新未完成，已尝试回滚到当前状态 {previous_mode}")
+        count = 0
+    notify(cfg, line, target_ip, mode, count, len(domains), latencies)
     return count
 
 
@@ -215,40 +332,124 @@ def is_monitor_network_alive(min_alive: int = 2) -> bool:
                 alive += 1
         except OSError:
             pass
-    return alive >= max(1, min_alive)
+    return alive >= min(3, max(1, min_alive))
 
 
 def check_external_latency(ip: str, port: int, region: str, threshold: float) -> bool:
-    nodes = REGION_NODES.get(region, REGION_NODES["jp"])
-    query = urllib.parse.urlencode({"host": f"{ip}:{port}", "max_nodes": ",".join(nodes)})
+    countries = REGION_NODES.get(region)
+    if not countries:
+        log(f"Check-Host 区域无效: {region}，按保守策略拦截切换")
+        return True
+    headers = {"Accept": "application/json"}
     try:
-        first = _request_json(urllib.request.Request("https://check-host.net/check-tcp?" + query), 15)
+        hosts = _request_json(
+            urllib.request.Request("https://check-host.net/nodes/hosts", headers=headers), 15
+        ).get("nodes")
+        if not isinstance(hosts, dict):
+            raise EngineError("Check-Host 节点列表格式无效")
+        nodes = _select_check_host_nodes(hosts, countries)
+
+        query = urllib.parse.urlencode(
+            [("host", f"{ip}:{port}"), *(("node", node) for node in nodes)]
+        )
+        first = _request_json(
+            urllib.request.Request("https://check-host.net/check-tcp?" + query, headers=headers), 15
+        )
         request_id = first.get("request_id")
-        if not request_id:
+        selected_nodes = first.get("nodes")
+        if not request_id or not isinstance(selected_nodes, dict) or set(selected_nodes) != set(nodes):
+            log("Check-Host 未接受完整区域节点请求，按保守策略拦截切换")
             return True
-        observed: list[float] = []
         for _ in range(8):
             time.sleep(2)
-            result = _request_json(urllib.request.Request("https://check-host.net/check-result/" + urllib.parse.quote(str(request_id), safe="")), 15)
-            values: list[float] = []
-            def walk(value: Any) -> None:
-                if isinstance(value, dict):
-                    if isinstance(value.get("time"), (int, float)):
-                        values.append(float(value["time"]) * 1000)
-                    for child in value.values():
-                        walk(child)
-                elif isinstance(value, list):
-                    for child in value:
-                        walk(child)
-            walk(result)
+            result = _request_json(
+                urllib.request.Request(
+                    "https://check-host.net/check-result/"
+                    + urllib.parse.quote(str(request_id), safe=""),
+                    headers=headers,
+                ),
+                15,
+            )
+            values = _extract_tcp_latencies(result)
             if values and any(value <= threshold for value in values):
                 return True
-            observed.extend(values)
-        # 无有效第三方探测结果属于不确定状态，按保守策略拦截自动切换。
-        return not observed
+            if all(_has_completed_tcp_probe(result.get(node)) for node in nodes):
+                return False
+        # 节点未完成或没有给出可判定结果时按保守策略阻止切换。
+        return True
     except EngineError as exc:
         log(f"Check-Host 仲裁失败，按保守策略拦截切换: {exc}")
         return True
+
+
+def _select_check_host_nodes(hosts: Mapping[str, Any], countries: tuple[str, ...]) -> list[str]:
+    grouped: dict[str, list[str]] = {country: [] for country in countries}
+    for hostname, details in hosts.items():
+        if not isinstance(hostname, str) or not isinstance(details, dict):
+            continue
+        location = details.get("location")
+        if not isinstance(location, list) or not location:
+            continue
+        country = str(location[0]).lower()
+        if country == "gb":
+            country = "uk"
+        if country in grouped:
+            grouped[country].append(hostname)
+
+    nodes: list[str] = []
+    for country in countries:
+        candidates = sorted(grouped[country])
+        nodes.extend(candidates[:3] if country == "us" else candidates[:1])
+    if len(nodes) < 2:
+        raise EngineError("Check-Host 可用区域节点少于两个")
+    return nodes
+
+
+def _tcp_probe_status(value: Any) -> int | None:
+    if (
+        isinstance(value, list)
+        and len(value) >= 2
+        and value[0] in (0, 1, "0", "1", False, True)
+        and isinstance(value[1], (int, float))
+    ):
+        return int(value[0])
+    return None
+
+
+def _extract_tcp_latencies(result: Any) -> list[float]:
+    """读取 Check-Host TCP 的 [状态, 秒数, ...] 结果并换算为毫秒。"""
+    values: list[float] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            if isinstance(value.get("time"), (int, float)):
+                values.append(float(value["time"]) * 1000)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            status = _tcp_probe_status(value)
+            if status == 1 and isinstance(value[1], (int, float)):
+                values.append(float(value[1]) * 1000)
+            elif status is None:
+                for child in value:
+                    walk(child)
+
+    walk(result)
+    return values
+
+
+def _has_completed_tcp_probe(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value) and (
+            "time" in value
+            or "error" in value
+            or any(_has_completed_tcp_probe(child) for child in value.values())
+        )
+    if isinstance(value, list):
+        if _tcp_probe_status(value) is not None:
+            return True
+        return any(_has_completed_tcp_probe(child) for child in value)
+    return False
 
 
 def state_path(line_id: str) -> Path:
@@ -309,6 +510,10 @@ def monitor(line_id: str) -> int:
                 line = get_line(cfg, line_id)
                 global_cfg = cfg["global"]
                 port = int(line.get("port", global_cfg.get("tcp_port", 22)))
+                interval = int(global_cfg.get("check_interval", 30))
+                recovery_interval = int(global_cfg.get("recovery_interval", 1800))
+                timeout = float(global_cfg.get("probe_timeout", 2.5))
+                external_threshold = float(global_cfg.get("external_threshold_ms", 150))
                 state = get_state(line_id)
                 if state == "MAIN":
                     failed, latency, samples = tcping(line["main_ip"], port, 5, timeout)
@@ -354,18 +559,25 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.switch and args.backup:
         parser.error("--switch 和 --backup 不能同时使用")
-    cfg = load_config()
-    line = get_line(cfg, str(args.line))
-    if args.status:
-        print(f"{line['name']}: {get_state(str(args.line))}")
-        return 0
-    if args.switch:
-        switch_once(cfg, str(args.line), line, "MAIN")
-        return 0
-    if args.backup:
-        switch_once(cfg, str(args.line), line, "BACKUP")
-        return 0
-    return monitor(str(args.line))
+    try:
+        cfg = load_config()
+        if args.status:
+            line = cfg["lines"].get(str(args.line))
+            if not isinstance(line, dict):
+                raise EngineError(f"找不到 {args.line} 号线配置")
+            print(f"{line['name']}: {get_state(str(args.line))}")
+            return 0
+        line = get_line(cfg, str(args.line))
+        if args.switch:
+            switch_once(cfg, str(args.line), line, "MAIN")
+            return 0
+        if args.backup:
+            switch_once(cfg, str(args.line), line, "BACKUP")
+            return 0
+        return monitor(str(args.line))
+    except EngineError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

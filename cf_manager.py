@@ -274,7 +274,7 @@ class Credentials:
     @classmethod
     def from_mapping(cls, values: Mapping[str, str]) -> "Credentials":
         return cls(
-            cf_api_token=values.get("CF_API_TOKEN", values.get("CF_API_TOKEN", "")),
+            cf_api_token=values.get("CF_API_TOKEN", ""),
             tg_token=values.get("TG_TOKEN", values.get("TG_BOT_TOKEN", "")),
             tg_group_chat_id=values.get("TG_GROUP_CHAT_ID", ""),
             tg_private_chat_id=values.get("TG_PRIVATE_CHAT_ID", ""),
@@ -513,15 +513,16 @@ class CloudflareClient:
         return dict(result.get("result", {}))
 
 
-def _json_literal(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2)
+def _python_literal(value: Any) -> str:
+    """Render JSON-compatible data as valid Python source literals."""
+    return repr(value)
 
 
 def render_failover_script(config: LineConfig, credentials: Credentials, paths: Paths | None = None) -> str:
     """生成含三级复核、区域仲裁和双推通知规范的独立监控脚本。"""
     config.validate()
     paths = paths or Paths()
-    domains_json = _json_literal([item.to_dict() for item in config.domains])
+    domains_json = _python_literal([item.to_dict() for item in config.domains])
     template = r'''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """由 cf_manager.py 生成的线路监控脚本。修改配置请回到管理中心。"""
@@ -602,30 +603,86 @@ def _extract_times(value):
         for child in value.values():
             yield from _extract_times(child)
     elif isinstance(value, list):
-        for child in value:
-            yield from _extract_times(child)
+        if len(value) >= 2 and value[0] in (1, "1", True) and isinstance(value[1], (int, float)):
+            yield float(value[1]) * 1000.0
+        elif not value or value[0] not in (0, 1, "0", "1", False, True):
+            for child in value:
+                yield from _extract_times(child)
+
+
+def _tcp_probe_complete(value):
+    if isinstance(value, dict):
+        return bool(value) and (
+            "time" in value
+            or "error" in value
+            or any(_tcp_probe_complete(child) for child in value.values())
+        )
+    if isinstance(value, list):
+        if (
+            len(value) >= 2
+            and value[0] in (0, 1, "0", "1", False, True)
+            and isinstance(value[1], (int, float))
+        ):
+            return True
+        return any(_tcp_probe_complete(child) for child in value)
+    return False
+
+
+def _select_region_nodes(hosts, countries):
+    grouped = {country: [] for country in countries}
+    for hostname, details in hosts.items():
+        if not isinstance(hostname, str) or not isinstance(details, dict):
+            continue
+        location = details.get("location")
+        if not isinstance(location, list) or not location:
+            continue
+        country = str(location[0]).lower()
+        if country == "gb":
+            country = "uk"
+        if country in grouped:
+            grouped[country].append(hostname)
+    selected = []
+    for country in countries:
+        candidates = sorted(grouped[country])
+        selected.extend(candidates[:3] if country == "us" else candidates[:1])
+    if len(selected) < 2:
+        raise ValueError("Check-Host 可用区域节点少于两个")
+    return selected
 
 
 def check_external_latency_by_region(ip):
     """调用 Check-Host 区域节点，任意正常节点都拦截误切。"""
-    nodes = CHECK_HOST_NODES.get(REGION, CHECK_HOST_NODES["jp"])
-    query = urllib.parse.urlencode({"host": "%s:%s" % (ip, PORT), "max_nodes": ",".join(nodes)})
-    request = urllib.request.Request("https://check-host.net/check-tcp?" + query, headers={"Accept": "application/json"})
+    countries = CHECK_HOST_NODES.get(REGION)
+    if not countries:
+        log("Check-Host 区域配置无效，将按保守策略拦截切线")
+        return True
+    headers = {"Accept": "application/json"}
     try:
+        with urllib.request.urlopen(urllib.request.Request("https://check-host.net/nodes/hosts", headers=headers), timeout=15) as response:
+            hosts = json.loads(response.read().decode("utf-8")).get("nodes")
+        if not isinstance(hosts, dict):
+            raise ValueError("节点列表格式无效")
+        nodes = _select_region_nodes(hosts, countries)
+        query = urllib.parse.urlencode([("host", "%s:%s" % (ip, PORT))] + [("node", node) for node in nodes])
+        request = urllib.request.Request("https://check-host.net/check-tcp?" + query, headers=headers)
         with urllib.request.urlopen(request, timeout=15) as response:
             first = json.loads(response.read().decode("utf-8"))
         request_id = first.get("request_id")
-        if not request_id:
-            return False
+        selected = first.get("nodes")
+        if not request_id or not isinstance(selected, dict) or set(selected) != set(nodes):
+            log("Check-Host 未接受完整区域节点请求，将按保守策略拦截切线")
+            return True
         result_url = "https://check-host.net/check-result/" + urllib.parse.quote(str(request_id), safe="")
         for _ in range(8):
             time.sleep(2)
-            with urllib.request.urlopen(result_url, timeout=15) as response:
+            with urllib.request.urlopen(urllib.request.Request(result_url, headers=headers), timeout=15) as response:
                 result = json.loads(response.read().decode("utf-8"))
             times = list(_extract_times(result))
             if any(value <= EXTERNAL_THRESHOLD_MS for value in times):
                 return True
-        return False
+            if all(_tcp_probe_complete(result.get(node)) for node in nodes):
+                return False
+        return True
     except (OSError, ValueError, KeyError, urllib.error.URLError):
         log("Check-Host 仲裁请求失败，将按保守策略拦截切线")
         return True
@@ -669,7 +726,10 @@ def send_telegram(chat_id, text):
 
 def notify_switch(target_ip, reason, samples):
     # 群组消息刻意不放任何毫秒数字；详细数据只发私聊。
-    group_text = "【%s】主节点连接超时/线路异常，已切换备用节点。" % LINE_ALIAS
+    if target_ip == MAIN_IP:
+        group_text = "【%s】主节点已恢复，解析已切回主节点。" % LINE_ALIAS
+    else:
+        group_text = "【%s】主节点连接超时/线路异常，已切换备用节点。" % LINE_ALIAS
     private_text = "【%s】线路 %s 已切换到 %s。主节点=%s，复核延迟=%s，原因=%s" % (LINE_ALIAS, LINE_ID, target_ip, MAIN_IP, samples, reason)
     send_telegram(TG_GROUP_CHAT_ID, group_text)
     send_telegram(TG_PRIVATE_CHAT_ID, private_text)
@@ -775,7 +835,7 @@ if __name__ == "__main__":
 
 def render_manual_script(config: LineConfig, credentials: Credentials) -> str:
     config.validate()
-    records = _json_literal([item.to_dict() for item in config.domains])
+    records = _python_literal([item.to_dict() for item in config.domains])
     template = r'''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """线路 __LINE_ID__ 手动切换工具：cf__LINE_ID__.py [main|backup|IPv4]。"""
@@ -1153,7 +1213,7 @@ def prompt_ipv4(prompt: str, default: str | None = None) -> str:
         try:
             return str(ipaddress.IPv4Address(value))
         except ipaddress.AddressValueError:
-            warning("请输入合法 IPv4，例如 38.64.57.64")
+            warning("请输入合法 IPv4，例如 203.0.113.10")
 
 
 def choose_credentials(paths: Paths) -> Credentials:
@@ -1766,8 +1826,8 @@ def self_test() -> int:
             line_id=6,
             alias="6号线（测试）",
             region="eu",
-            main_ip="38.64.57.64",
-            backup_ip="38.207.162.102",
+            main_ip="203.0.113.10",
+            backup_ip="198.51.100.20",
             domains=[DomainRecord("zone", "record", "edge.example.com")],
         )
         credentials = Credentials("token", "tg", "-1001", "1002")

@@ -11,13 +11,16 @@ SRC_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip ca-certificates
+  DEBIAN_FRONTEND=noninteractive apt-get install -y git python3 python3-venv python3-pip ca-certificates
 else
-  echo "未检测到 apt-get，请先手动安装 python3、pip3 和 ca-certificates" >&2
+  echo "当前安装脚本只支持 Debian/Ubuntu（需要 apt-get）" >&2
+  exit 1
 fi
 
-python3 -m pip install --break-system-packages pyTelegramBotAPI 2>/dev/null || python3 -m pip install pyTelegramBotAPI
 install -d -m 700 "$APP_DIR"
+python3 -m venv "$APP_DIR/.venv"
+"$APP_DIR/.venv/bin/pip" install --upgrade pip
+"$APP_DIR/.venv/bin/pip" install -r "$SRC_DIR/requirements.txt"
 install -o root -g root -m 700 "$SRC_DIR/failover_engine.py" "$SRC_DIR/menu.py" "$SRC_DIR/tg_bot.py" "$APP_DIR/"
 install -o root -g root -m 644 "$SRC_DIR/systemd/cf-failover@.service" "$SRC_DIR/systemd/tg-bot.service" /etc/systemd/system/
 if [[ ! -f "$APP_DIR/config.json" ]]; then

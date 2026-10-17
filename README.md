@@ -11,7 +11,7 @@
 - 线路分项编辑：选定线路后可查看脚本名与全部绑定域名，只修改主 IP、备用 IP，手动添加/删除域名；每次保存自动重写脚本并重启对应 systemd 服务。
 - Cloudflare Token：优先读取环境变量或已有 `cf_failover*.py`，也支持交互输入并调用 Token Verify API。
 - Cloudflare Zone/A 记录：列出 Zone 和 A 记录，支持逗号多选，也支持现场新建 A 记录。
-- 自动脚本：5 包 TCP 平均延迟、三次间隔 20 秒复核、Check-Host 区域仲裁、状态文件和锁文件。
+- 自动脚本：5 包 TCP 平均延迟、三次间隔 20 秒复核、按官方节点列表筛选的 Check-Host 区域仲裁、状态文件和锁文件。
 - 通知规范：群组消息不包含具体毫秒数，私聊消息包含目标 IP 和切换细节。
 - 安全注入：`tg_bot.py` 修改前生成 `.bak`，使用 AST 定位字典并在写回前再次编译；失败自动恢复。
 - 备份包：包含线路脚本、systemd 单元、机器人、配置和 `restore_cf_cluster.sh`。
@@ -33,12 +33,14 @@ cf-failover@1.service              # systemd 模板，线路编号统一
 
 每条线路也可以单独设置 `port`（例如 22、80、443）；不填写时使用全局 `tcp_port`。
 
+安装器会在 `/opt/cf-failover/.venv` 建立项目独立的 Python 环境，不会把 Telegram 依赖强行装进 Debian/Ubuntu 的系统 Python。
+
 ### 新机器一键安装
 
-公开仓库可以直接执行：
+Debian/Ubuntu 新 VPS 可以直接执行（先自动安装 Git）：
 
 ```bash
-git clone https://github.com/jaycen-0502/cf-failover-manager.git && cd cf-failover-manager && sudo bash install.sh
+sudo apt-get update -y && sudo apt-get install -y git && git clone https://github.com/jaycen-0502/cf-failover-manager.git && cd cf-failover-manager && sudo bash install.sh
 ```
 
 然后编辑配置并打开菜单：
@@ -48,7 +50,26 @@ sudo nano /opt/cf-failover/config.json
 sudo cf-menu
 ```
 
-菜单支持查看状态、新增/修改/删除线路、配置 Token、强制切主/切备、重启服务和导出配置备份。安装脚本不会自动把示例 Token 或示例 IP 当成生产配置。
+菜单支持查看状态、新增/修改/删除线路、强制切主/切备、重启服务和导出配置备份。安装脚本不会自动把示例 Token 或示例 IP 当成生产配置。
+
+### Token 和生产 IP 的填入/删除
+
+进入 `sudo cf-menu` 后：
+
+1. 选择 `[4] 配置全局 Token 与管理员 ID`。
+2. 选择 `[1]` 填入/更新 Cloudflare Token，选择 `[2]` 删除 Cloudflare Token。
+3. 选择 `[3]` 填入/更新 Telegram Token，选择 `[4]` 删除 Telegram Token。
+4. 删除 Cloudflare Token 会自动停用全部线路；删除 Telegram Token 会自动停用 TG Bot。删除操作都要求输入 `DELETE` 二次确认。
+
+填入 Token 时会先向对应官方 API 验证有效性；输错或网络验证失败不会覆盖原配置，也不会显示 Token 明文。
+
+修改线路的主备生产 IP：
+
+1. 主菜单选择 `[2]`，输入线路编号。
+2. 选择 `[2]` 填入/修改主 IP，选择 `[3]` 填入/修改备用 IP。
+3. 选择 `[7]` 删除主 IP，选择 `[8]` 删除备用 IP；删除 IP 后该线路会自动停用，重新填回合法 IP 后自动恢复服务。
+
+每次有效修改都会原子写入 `/opt/cf-failover/config.json` 并自动重启对应线路；配置不完整时只保存、不启动服务，避免空 IP 进入监控。
 
 ### 通用引擎快捷命令
 

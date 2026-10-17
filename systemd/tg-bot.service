@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -u /opt/cf-failover/tg_bot.py
+ExecStart=/opt/cf-failover/.venv/bin/python -u /opt/cf-failover/tg_bot.py
 Restart=always
 RestartSec=5
 User=root

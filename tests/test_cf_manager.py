@@ -3,6 +3,7 @@ import json
 import tarfile
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -38,6 +39,55 @@ class ManagerTests(unittest.TestCase):
         credentials = cf_manager.Credentials("cf", "tg", "group", "private")
         ast.parse(cf_manager.render_failover_script(config, credentials, self.paths))
         ast.parse(cf_manager.render_manual_script(config, credentials))
+
+    def test_generated_check_host_uses_repeated_nodes_and_tcp_results(self):
+        config = self.config()
+        script = cf_manager.render_failover_script(
+            config, cf_manager.Credentials("cf", "tg", "group", "private"), self.paths
+        )
+        namespace = {"__name__": "generated_failover_test"}
+        with mock.patch.dict("sys.modules", {"fcntl": mock.Mock()}):
+            exec(compile(script, "generated_failover.py", "exec"), namespace)
+        manual_namespace = {"__name__": "generated_manual_test"}
+        exec(
+            compile(
+                cf_manager.render_manual_script(
+                    config, cf_manager.Credentials("cf", "tg", "group", "private")
+                ),
+                "generated_manual.py",
+                "exec",
+            ),
+            manual_namespace,
+        )
+        self.assertIs(manual_namespace["RECORDS"][0]["proxied"], False)
+        nodes = {
+            "de1.node.check-host.net": {"location": ["de", "Germany", "Nuremberg"]},
+            "nl1.node.check-host.net": {"location": ["nl", "Netherlands", "Amsterdam"]},
+            "uk1.node.check-host.net": {"location": ["gb", "UK", "London"]},
+            "us1.node.check-host.net": {"location": ["us", "USA", "Los Angeles"]},
+        }
+        selected = sorted(host for host, item in nodes.items() if item["location"][0] in {"de", "nl", "gb"})
+
+        def response(payload):
+            item = mock.MagicMock()
+            item.read.return_value = json.dumps(payload).encode()
+            item.__enter__.return_value = item
+            return item
+
+        opener = mock.Mock(
+            side_effect=[
+                response({"nodes": nodes}),
+                response({"request_id": "request", "nodes": {host: [] for host in selected}}),
+                response({host: [{"error": "connection refused"}] for host in selected}),
+            ]
+        )
+        with mock.patch.object(namespace["urllib"].request, "urlopen", opener), mock.patch.object(
+            namespace["time"], "sleep"
+        ):
+            self.assertFalse(namespace["check_external_latency_by_region"]("198.51.100.20"))
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(opener.call_args_list[1].args[0].full_url).query)
+        self.assertEqual(query["node"], selected)
+        self.assertNotIn("max_nodes", query)
 
     def test_tg_injection_keeps_valid_python_and_backup(self):
         self.paths.tg_bot.parent.mkdir(parents=True)
